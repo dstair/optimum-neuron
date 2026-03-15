@@ -36,7 +36,10 @@ if is_vllm_available():
 
     from vllm.entrypoints.openai.api_server import run_server
     from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
-    from vllm.utils import FlexibleArgumentParser
+    try:
+        from vllm.utils import FlexibleArgumentParser
+    except ImportError:
+        from vllm.engine.arg_utils import FlexibleArgumentParser
 
     from ...neuron.vllm.model_loader import VLLM_2_TRANSFORMERS_TASK_MAPPING
 

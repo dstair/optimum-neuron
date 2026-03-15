@@ -93,10 +93,10 @@ class OptimumNeuronModel(nn.Module):
         else:
             # Model needs to be exported: look for compatible hub cached configs
             batch_size = scheduler_config.max_num_seqs
-            sequence_length = scheduler_config.max_model_len
+            sequence_length = getattr(scheduler_config, "max_model_len", None) or model_config.max_model_len
             torch_dtype = None if model_config.dtype is None else model_config.dtype
 
-            task = model_config.task or "generate"
+            task = getattr(model_config, "task", None) or "generate"
             hf_task = VLLM_2_TRANSFORMERS_TASK_MAPPING[task]
             cached_entries = select_hub_cached_entries(
                 model_name_or_path,

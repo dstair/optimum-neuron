@@ -23,7 +23,10 @@ from vllm.tasks import SupportedTask
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.worker.worker_base import WorkerBase
+try:
+    from vllm.worker.worker_base import WorkerBase
+except (ImportError, ModuleNotFoundError):
+    from vllm.v1.worker.worker_base import WorkerBase
 
 from .runner import OptimumNeuronModelRunner
 
@@ -44,19 +47,23 @@ class OptimumNeuronWorker(WorkerBase):
         distributed_init_method: str,
         is_driver_worker: bool = False,
     ) -> None:
-        WorkerBase.__init__(self, vllm_config=vllm_config)
-        self.local_rank = local_rank
-        self.rank = rank
-        self.distributed_init_method = distributed_init_method
-        self.is_driver_worker = is_driver_worker
+        WorkerBase.__init__(
+            self,
+            vllm_config=vllm_config,
+            local_rank=local_rank,
+            rank=rank,
+            distributed_init_method=distributed_init_method,
+            is_driver_worker=is_driver_worker,
+        )
 
         assert self.lora_config is None, "LoRA is not supported for optimum-neuron framework."
         assert self.speculative_config is None, "Speculative decoding is not supported for optimum-neuron framework."
 
         if self.model_config.trust_remote_code:
-            # note: lazy import to avoid importing torch before initializing
-            from vllm.utils import init_cached_hf_modules
-
+            try:
+                from vllm.utils import init_cached_hf_modules
+            except ImportError:
+                from vllm.utils.import_utils import init_cached_hf_modules
             init_cached_hf_modules()
 
         self.model_runner = OptimumNeuronModelRunner.create(vllm_config=vllm_config)
