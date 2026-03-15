@@ -12,7 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Smoke tests for Moonlight 16B-A3B Optimum Neuron port (CPU-only)."""
+"""Smoke tests for Moonlight (DeepSeek V3 architecture) Optimum Neuron port (CPU-only).
+
+Set MOONLIGHT_MODEL_PATH to the HuggingFace checkpoint directory, e.g.:
+    MOONLIGHT_MODEL_PATH=/path/to/Moonlight-16B-A3B-Instruct pytest tests/decoder/test_moonlight_smoke.py
+"""
+
+import os
 
 import pytest
 import torch
@@ -23,7 +29,7 @@ from optimum.neuron.models.inference.moonlight.modeling_moonlight import (
     convert_moonlight_hf_to_neuron_state_dict,
 )
 
-MODEL_PATH = "/home/ubuntu/environment/models/Moonlight-16B-A3B"
+MODEL_PATH = os.environ.get("MOONLIGHT_MODEL_PATH", "moonshotai/Moonlight-16B-A3B-Instruct")
 
 
 class TestMoonlightConfigLoading:

@@ -73,11 +73,14 @@ class OptimumNeuronPlatform(UnspecifiedPlatform):
                 vllm_config.cache_config.block_size = vllm_config.model_config.max_model_len
 
         if vllm_config.model_config:
-            if vllm_config.model_config.use_mla:
-                raise ValueError(
-                    "MLA (Multi-Layer Attention) is not supported on Optimum Neuron platform. "
-                    "Please set `use_mla` to False in the model configuration."
-                )
+            if vllm_config.model_config.is_deepseek_mla:
+                # Disable vLLM's MLA attention backend for DeepSeek/Moonlight models.
+                # optimum-neuron manages its own MLA attention and KV cache internally,
+                # so vLLM's GPU MLA handling must be bypassed.
+                import vllm.envs as envs
+
+                envs.VLLM_MLA_DISABLE = True
+                logger.info("Disabled vLLM MLA for Optimum Neuron platform (KV cache managed internally).")
 
             # Patch ModelConfig to avoid hard-coded check in vLLM
             def verify_with_parallel_config(parallel_config) -> None:
