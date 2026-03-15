@@ -25,6 +25,7 @@ from ..auto_model import register_neuron_model
 from .gemma3.modeling_gemma3 import Gemma3NxDModelForCausalLM
 from .granite.modeling_granite import GraniteNxDModelForCausalLM
 from .llama.modeling_llama import LlamaNxDModelForCausalLM
+from .moonlight.modeling_moonlight import MoonlightNxDModelForCausalLM
 from .llama4.modeling_llama4 import Llama4NxDModelForCausalLM
 from .mixtral.modeling_mixtral import MixtralNxDModelForCausalLM
 from .phi3.modeling_phi3 import Phi3NxDModelForCausalLM
@@ -58,6 +59,13 @@ class GraniteNeuronModelForCausalLM(GraniteNxDModelForCausalLM):
     """
     Granite model with NxD backend for inference on AWS Neuron.
     """
+
+    pass
+
+
+@register_neuron_model_for_inference("deepseek_v3", "text-generation")
+class MoonlightNeuronModelForCausalLM(MoonlightNxDModelForCausalLM):
+    """Moonlight/DeepSeek V3 model with NxD backend for inference on AWS Neuron."""
 
     pass
 

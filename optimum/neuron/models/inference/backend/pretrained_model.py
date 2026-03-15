@@ -423,9 +423,9 @@ class NxDPreTrainedModel(NeuronPreTrainedModel, ABC):
                     token=token,
                     allow_patterns=[cls.COMPILED_MODEL_FILE_NAME],
                 )
-                traced_model = torch.jit.load(os.path.join(tmpdir, cls.COMPILED_MODEL_FILE_NAME))
+                traced_model = torch.jit.load(os.path.join(tmpdir, cls.COMPILED_MODEL_FILE_NAME), map_location="cpu")
         else:
-            traced_model = torch.jit.load(os.path.join(model_id, cls.COMPILED_MODEL_FILE_NAME))
+            traced_model = torch.jit.load(os.path.join(model_id, cls.COMPILED_MODEL_FILE_NAME), map_location="cpu")
         graph_builders = cls.create_graph_builders(config=config, neuron_config=neuron_config)
         model = cls(
             config=config,
