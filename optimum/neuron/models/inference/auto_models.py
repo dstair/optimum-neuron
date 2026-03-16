@@ -25,9 +25,9 @@ from ..auto_model import register_neuron_model
 from .gemma3.modeling_gemma3 import Gemma3NxDModelForCausalLM
 from .granite.modeling_granite import GraniteNxDModelForCausalLM
 from .llama.modeling_llama import LlamaNxDModelForCausalLM
-from .moonlight.modeling_moonlight import MoonlightNxDModelForCausalLM
 from .llama4.modeling_llama4 import Llama4NxDModelForCausalLM
 from .mixtral.modeling_mixtral import MixtralNxDModelForCausalLM
+from .moonlight.modeling_moonlight import MoonlightNxDModelForCausalLM
 from .phi3.modeling_phi3 import Phi3NxDModelForCausalLM
 from .qwen2.modeling_qwen2 import Qwen2NxDModelForCausalLM
 from .qwen3.modeling_qwen3 import Qwen3NxDModelForCausalLM, Qwen3NxDModelForEmbedding

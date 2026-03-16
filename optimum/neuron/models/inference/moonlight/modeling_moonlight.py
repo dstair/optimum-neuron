@@ -24,6 +24,11 @@ with sparse Mixture-of-Experts (MoE). Key differences from standard GQA models:
 import gc
 
 import torch
+from neuronx_distributed.modules.moe.expert_mlps_v2 import ExpertMLPsV2
+from neuronx_distributed.modules.moe.model import MoE
+from neuronx_distributed.modules.moe.moe_configs import RoutedExpertsMLPOpsConfig
+from neuronx_distributed.modules.moe.routing import RouterTopK
+from neuronx_distributed.modules.moe.shared_experts import SharedExperts
 from neuronx_distributed.parallel_layers.layers import (
     ColumnParallelLinear,
     ParallelEmbedding,
@@ -42,14 +47,9 @@ from ..backend.modules.attention.utils import (
     apply_rotary_pos_emb,
     manual_softmax,
 )
-from neuronx_distributed.modules.moe.expert_mlps_v2 import ExpertMLPsV2
-from neuronx_distributed.modules.moe.model import MoE
-from neuronx_distributed.modules.moe.moe_configs import RoutedExpertsMLPOpsConfig
-from neuronx_distributed.modules.moe.routing import RouterTopK
-from neuronx_distributed.modules.moe.shared_experts import SharedExperts
-
 from ..backend.modules.decoder import NxDDecoderModelForCausalLM, NxDModelForCausalLM
 from ..backend.modules.rms_norm import NeuronRMSNorm
+
 
 # Note: initialize_moe_module was replaced by direct MoE construction
 # in NeuronMoonlightDecoderLayer._build_moe() to support routed_scaling_factor.
@@ -84,17 +84,13 @@ def convert_moonlight_hf_to_neuron_state_dict(state_dict, config, neuron_config)
         # Rename router weights
         router_key = f"layers.{l}.mlp.gate.weight"
         if router_key in state_dict:
-            state_dict[f"layers.{l}.mlp.router.linear_router.weight"] = (
-                state_dict[router_key].detach().clone()
-            )
+            state_dict[f"layers.{l}.mlp.router.linear_router.weight"] = state_dict[router_key].detach().clone()
             del state_dict[router_key]
 
         # Rename e_score_correction_bias (used by noaux_tc routing)
         bias_key = f"layers.{l}.mlp.gate.e_score_correction_bias"
         if bias_key in state_dict:
-            state_dict[f"layers.{l}.mlp.router.e_score_correction_bias"] = (
-                state_dict[bias_key].detach().clone()
-            )
+            state_dict[f"layers.{l}.mlp.router.e_score_correction_bias"] = state_dict[bias_key].detach().clone()
             del state_dict[bias_key]
 
         # Check if expert weights exist
@@ -315,16 +311,15 @@ class NeuronMoonlightAttention(nn.Module):
         # Weight absorption: decompose kv_b_proj weight into Q-absorb and V-absorb
         wkv_b = self.kv_b_proj.weight
         wkv_b = wkv_b.view(self.num_heads, -1, self.kv_lora_rank)
-        q_absorb = wkv_b[:, : self.qk_nope_head_dim]       # (H, nope_dim, kv_lora_rank)
-        out_absorb = wkv_b[:, self.qk_nope_head_dim :, :]   # (H, v_dim, kv_lora_rank)
+        q_absorb = wkv_b[:, : self.qk_nope_head_dim]  # (H, nope_dim, kv_lora_rank)
+        out_absorb = wkv_b[:, self.qk_nope_head_dim :, :]  # (H, v_dim, kv_lora_rank)
 
         # Absorb Q-nope: project from head_dim to kv_lora_rank
         q_nope = torch.einsum("hdc,bhqd->bhqc", q_absorb, q_nope)
 
         # Compute attention scores using absorbed Q and compressed KV
-        active_scores = (
-            torch.matmul(q_pe, k_pe.transpose(2, 3))
-            + torch.einsum("bhqc,blc->bhql", q_nope, compressed_kv)
+        active_scores = torch.matmul(q_pe, k_pe.transpose(2, 3)) + torch.einsum(
+            "bhqc,blc->bhql", q_nope, compressed_kv
         )
         active_scores *= self.softmax_scale
 
@@ -339,15 +334,12 @@ class NeuronMoonlightAttention(nn.Module):
         else:
             # Decode: unpack cached KV
             cached = past_key_value[0].squeeze(1)  # (bsz, seq_len, rope_dim + kv_lora_rank)
-            k_pe_prior, compressed_kv_prior = torch.tensor_split(
-                cached, [self.qk_rope_head_dim], dim=-1
-            )
+            k_pe_prior, compressed_kv_prior = torch.tensor_split(cached, [self.qk_rope_head_dim], dim=-1)
             k_pe_prior = k_pe_prior.unsqueeze(1)  # (bsz, 1, seq_len, rope_dim)
 
             # Prior attention scores using absorption
-            prior_scores = (
-                torch.matmul(q_pe, k_pe_prior.transpose(2, 3))
-                + torch.einsum("bhqc,blc->bhql", q_nope, compressed_kv_prior)
+            prior_scores = torch.matmul(q_pe, k_pe_prior.transpose(2, 3)) + torch.einsum(
+                "bhqc,blc->bhql", q_nope, compressed_kv_prior
             )
             prior_scores *= self.softmax_scale
 
@@ -581,9 +573,7 @@ def _patch_neuron_config_skip_weights(neuron_config):
             cls.__name__,
             (cls,),
             {
-                "weights_to_skip_layout_optimization": property(
-                    lambda self: _MOONLIGHT_SKIP_WEIGHTS
-                ),
+                "weights_to_skip_layout_optimization": property(lambda self: _MOONLIGHT_SKIP_WEIGHTS),
                 "_moonlight_patched": True,
             },
         )

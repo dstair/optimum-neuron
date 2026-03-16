@@ -29,6 +29,7 @@ from optimum.neuron.models.inference.moonlight.modeling_moonlight import (
     convert_moonlight_hf_to_neuron_state_dict,
 )
 
+
 MODEL_PATH = os.environ.get("MOONLIGHT_MODEL_PATH", "moonshotai/Moonlight-16B-A3B-Instruct")
 
 
@@ -104,17 +105,13 @@ class TestStateDictConversion:
                 )
 
     def test_rank_tensors_added(self):
-        result = convert_moonlight_hf_to_neuron_state_dict(
-            dict(self.state_dict), self.config, self.neuron_config
-        )
+        result = convert_moonlight_hf_to_neuron_state_dict(dict(self.state_dict), self.config, self.neuron_config)
         assert "rank_util.rank" in result
         for l in range(self.num_layers):
             assert f"layers.{l}.self_attn.rank_util.rank" in result
 
     def test_router_renamed(self):
-        result = convert_moonlight_hf_to_neuron_state_dict(
-            dict(self.state_dict), self.config, self.neuron_config
-        )
+        result = convert_moonlight_hf_to_neuron_state_dict(dict(self.state_dict), self.config, self.neuron_config)
         # Layer 0 (dense) should NOT have router
         assert "layers.0.mlp.router.linear_router.weight" not in result
         # Layer 1 (MoE) should have renamed router
@@ -122,16 +119,12 @@ class TestStateDictConversion:
         assert "layers.1.mlp.gate.weight" not in result
 
     def test_e_score_correction_bias_renamed(self):
-        result = convert_moonlight_hf_to_neuron_state_dict(
-            dict(self.state_dict), self.config, self.neuron_config
-        )
+        result = convert_moonlight_hf_to_neuron_state_dict(dict(self.state_dict), self.config, self.neuron_config)
         assert "layers.1.mlp.router.e_score_correction_bias" in result
         assert "layers.1.mlp.gate.e_score_correction_bias" not in result
 
     def test_expert_weights_fused(self):
-        result = convert_moonlight_hf_to_neuron_state_dict(
-            dict(self.state_dict), self.config, self.neuron_config
-        )
+        result = convert_moonlight_hf_to_neuron_state_dict(dict(self.state_dict), self.config, self.neuron_config)
         # gate_up_proj: (num_experts, hidden_size, 2 * moe_intermediate_size)
         gate_up = result["layers.1.mlp.expert_mlps.mlp_op.gate_up_proj.weight"]
         assert gate_up.shape == (self.num_experts, self.hidden_size, 2 * self.moe_intermediate_size)
@@ -147,16 +140,12 @@ class TestStateDictConversion:
             assert f"layers.1.mlp.experts.{e}.down_proj.weight" not in result
 
     def test_shared_experts_untouched(self):
-        result = convert_moonlight_hf_to_neuron_state_dict(
-            dict(self.state_dict), self.config, self.neuron_config
-        )
+        result = convert_moonlight_hf_to_neuron_state_dict(dict(self.state_dict), self.config, self.neuron_config)
         assert "layers.1.mlp.shared_experts.gate_proj.weight" in result
 
     def test_dense_layer_untouched(self):
         original_q = self.state_dict["layers.0.self_attn.q_proj.weight"].clone()
-        result = convert_moonlight_hf_to_neuron_state_dict(
-            dict(self.state_dict), self.config, self.neuron_config
-        )
+        result = convert_moonlight_hf_to_neuron_state_dict(dict(self.state_dict), self.config, self.neuron_config)
         assert torch.equal(result["layers.0.self_attn.q_proj.weight"], original_q)
 
 
@@ -164,8 +153,6 @@ class TestRegistration:
     """Test 3: Verify the model is importable and registered."""
 
     def test_import_model_class(self):
-        from optimum.neuron.models.inference.moonlight.modeling_moonlight import MoonlightNxDModelForCausalLM
-
         assert MoonlightNxDModelForCausalLM._model_cls is not None
 
     def test_import_registration(self):
