@@ -61,11 +61,6 @@ class OptimumNeuronModel(nn.Module):
                 "optimum-neuron does not support pipeline parallelism. "
                 "Please set pipeline_parallel_size to 1 in the parallel config."
             )
-        if parallel_config.data_parallel_size > 1:
-            raise ValueError(
-                "optimum-neuron does not support data parallelism. "
-                "Please set data_parallel_size to 1 in the parallel config."
-            )
         tp_degree = parallel_config.tensor_parallel_size
         available_cores = get_available_cores()
         if tp_degree > available_cores:
@@ -85,6 +80,17 @@ class OptimumNeuronModel(nn.Module):
         except EnvironmentError:
             neuron_config = None
         if neuron_config is not None:
+            # Validate max_num_seqs against compiled batch_size.
+            # The Neuron worker returns empty kv_cache_spec, so vLLM's block manager
+            # cannot limit concurrent sequences. Without this check, the scheduler
+            # may send more requests than the compiled NEFF batch_size supports.
+            max_num_seqs = scheduler_config.max_num_seqs
+            if max_num_seqs > neuron_config.batch_size:
+                raise ValueError(
+                    f"max_num_seqs ({max_num_seqs}) exceeds the compiled model "
+                    f"batch_size ({neuron_config.batch_size}). "
+                    f"Please set max_num_seqs <= {neuron_config.batch_size}."
+                )
             neuron_model = cls.auto_class.from_pretrained(
                 model_name_or_path,
                 revision=revision,
@@ -194,6 +200,24 @@ class OptimumNeuronModelForCausalLM(OptimumNeuronModel):
         if seq_ids.shape[0] != 1:
             output = torch.index_select(output, 0, restored_indices)
 
+        return output
+
+    def prefill_chunk_vllm(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        seq_ids: torch.Tensor,
+        sampling_params: torch.Tensor,
+    ) -> torch.Tensor:
+        """Process one chunk of a single prompt and return logits [1, vocab].
+
+        Only valid when neuron_config.prefill_chunk_size > 0.
+        Always called with batch_size=1: processing one sequence at a time
+        is not only simpler but also faster and consumes less device memory.
+        """
+        output = self.model.prefill_chunk(input_ids, position_ids, seq_ids, sampling_params)
+        # prefill_chunk returns [1, 1, vocab]; squeeze to [1, vocab]
+        output = output[:, -1, :]
         return output
 
 

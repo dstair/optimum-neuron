@@ -1,3 +1,93 @@
+"""Pytest fixtures and CLI for provisioning compiled Neuron LLM test models.
+
+Overview
+--------
+This module provides session-scoped pytest fixtures that compile (export) HF models
+to Neuron NEFFs and make them available as local directories during test runs.  It is
+registered as a pytest plugin via ``pytest_plugins`` in ``tests/conftest.py``.
+
+Model configurations
+--------------------
+Two dictionaries define every (model, batch_size, sequence_length) combination that
+will be compiled:
+
+- ``GENERATE_LLM_MODEL_CONFIGURATIONS`` — text-generation models, built from
+  ``GENERATE_LLM_MODEL_IDS`` × [(4, 1024), (1, 8192)].
+- ``EMBED_LLM_MODEL_CONFIGURATIONS`` — embedding models, built from
+  ``EMBED_LLM_MODEL_IDS`` × [(4, 8192), (6, 8192)].
+
+Configuration names follow the pattern ``<model>-<batch_size>x<sequence_length>``,
+e.g. ``llama-4x1024``.  The merged dict ``LLM_MODEL_CONFIGURATIONS`` is the union of
+both.
+
+Caching strategy
+----------------
+Compiled models are expensive to produce (10-30+ min each on Neuron hardware).  To
+avoid recompilation, every exported model is pushed to a private HF Hub repo whose
+name encodes all the variables that would change the compilation output::
+
+    <org>/optimum-neuron-testing-<version>-<sdk_version>-<instance_type>-<code_hash>-<config_name>
+
+The ``<code_hash>`` (see ``get_neuron_models_hash()``) is a truncated SHA-256 of the
+git tree hashes of ``pyproject.toml`` and ``optimum/neuron/models/inference/``.  When
+*any* file inside those paths changes (even on an unrelated branch), the hash changes,
+causing a fresh export on next run.
+
+Compiled artifacts are also synchronized to a shared cache repo
+(``optimum-internal-testing/neuron-testing-cache``) so that the Neuron compiler cache
+on other machines can hit them.
+
+Cache invalidation
+------------------
+The hub repo name changes (and a re-export is triggered) when **any** of these change:
+
+1. ``optimum-neuron`` package version (``optimum.neuron.version.__version__``).
+2. Neuron SDK version (``optimum.neuron.version.__sdk_version__``).
+3. Instance type (e.g. ``inf2.8xlarge`` vs ``trn1.32xlarge``).
+4. Git content of ``pyproject.toml`` or ``optimum/neuron/models/inference/``.
+
+Old hub repos are **not** auto-deleted.  Prune them manually::
+
+    python tools/prune_test_models.py [--version <ver>] [--pattern <pat>] [--yes]
+
+Fixtures
+--------
+``any_generate_model``
+    Parametrized over *all* generation configs.  Each test using this fixture runs
+    once per config.  Use for broad cross-model validation (e.g. greedy expectations).
+
+``neuron_llm_config``
+    Provides a *single* config, chosen via ``@pytest.mark.parametrize`` with
+    ``indirect=True``::
+
+        @pytest.mark.parametrize("neuron_llm_config", ["llama-4x1024"], indirect=True)
+        def test_something(neuron_llm_config):
+            model_path = neuron_llm_config["neuron_model_path"]
+
+    Defaults to the first config (``llama-4x1024``) if no param is given.
+
+``speculation``
+    Session-scoped fixture that provides a ``(model_path, draft_model_path)`` tuple
+    for speculative decoding tests.
+
+All fixtures yield a ``dict`` with keys: ``name``, ``model_id``, ``task``,
+``export_kwargs``, ``neuron_model_id``, ``neuron_model_path``.
+
+CLI usage
+---------
+Run this file directly to pre-export models before running tests (this is what CI
+does)::
+
+    # Export all models
+    python tests/fixtures/llm/export_models.py
+
+    # Export only llama configs
+    python tests/fixtures/llm/export_models.py 'llama*'
+
+    # List available configs
+    python tests/fixtures/llm/export_models.py --list
+"""
+
 import copy
 import hashlib
 import logging
@@ -14,9 +104,9 @@ from optimum.neuron.utils.system import cores_per_device
 
 
 if is_package_available("transformers"):
-    from transformers import AutoConfig, AutoTokenizer
+    from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
-from optimum.neuron import NeuronModelForCausalLM, NeuronModelForEmbedding
+from optimum.neuron import NeuronModelForCausalLM, NeuronModelForEmbedding, NeuronModelForImageTextToText
 from optimum.neuron.cache import synchronize_hub_cache
 from optimum.neuron.models.inference.backend.config import NxDNeuronConfig
 from optimum.neuron.version import __sdk_version__ as sdk_version
@@ -43,7 +133,6 @@ GENERATE_LLM_MODEL_IDS = {
     "qwen2": "Qwen/Qwen2.5-0.5B",
     "gemma3": "unsloth/gemma-3-270m-it",
     "granite": "ibm-granite/granite-3.1-2b-instruct",
-    "phi": "microsoft/Phi-3.5-mini-instruct",
     "qwen3": "Qwen/Qwen3-0.6B",
     "smollm3": "HuggingFaceTB/SmolLM3-3B",
 }
@@ -52,10 +141,14 @@ EMBED_LLM_MODEL_IDS = {
     "qwen3-embedding": "Qwen/Qwen3-Embedding-0.6B",
 }
 
+VLM_MODEL_IDS = {
+    "smolvlm": "HuggingFaceTB/SmolVLM-256M-Instruct",
+}
+
 
 GENERATE_LLM_MODEL_CONFIGURATIONS = {}
 for model_name, model_id in GENERATE_LLM_MODEL_IDS.items():
-    for batch_size, sequence_length in [(4, 4096), (1, 8192)]:
+    for batch_size, sequence_length in [(4, 1024), (1, 8192)]:
         GENERATE_LLM_MODEL_CONFIGURATIONS[f"{model_name}-{batch_size}x{sequence_length}"] = {
             "model_id": model_id,
             "task": "text-generation",
@@ -65,6 +158,17 @@ for model_name, model_id in GENERATE_LLM_MODEL_IDS.items():
                 "tensor_parallel_size": cores_per_device(),
             },
         }
+
+# TP=1 config for data-parallel tests (DP=2 needs 2 cores, each server uses 1 core)
+GENERATE_LLM_MODEL_CONFIGURATIONS["qwen3-tp1-4x1024"] = {
+    "model_id": GENERATE_LLM_MODEL_IDS["qwen3"],
+    "task": "text-generation",
+    "export_kwargs": {
+        "batch_size": 4,
+        "sequence_length": 1024,
+        "tensor_parallel_size": 1,
+    },
+}
 
 EMBED_LLM_MODEL_CONFIGURATIONS = {}
 for model_name, model_id in EMBED_LLM_MODEL_IDS.items():
@@ -80,10 +184,30 @@ for model_name, model_id in EMBED_LLM_MODEL_IDS.items():
         }
 
 
+VLM_MODEL_CONFIGURATIONS = {}
+for model_name, model_id in VLM_MODEL_IDS.items():
+    for batch_size, sequence_length in [(2, 2048)]:
+        VLM_MODEL_CONFIGURATIONS[f"{model_name}-{batch_size}x{sequence_length}"] = {
+            "model_id": model_id,
+            "task": "image-text-to-text",
+            "export_kwargs": {
+                "batch_size": batch_size,
+                "sequence_length": sequence_length,
+                "tensor_parallel_size": cores_per_device(),
+            },
+        }
+
 LLM_MODEL_CONFIGURATIONS = GENERATE_LLM_MODEL_CONFIGURATIONS | EMBED_LLM_MODEL_CONFIGURATIONS
 
 
 def get_neuron_models_hash():
+    """Compute a short content hash that changes when inference code or build config changes.
+
+    Uses ``git ls-tree HEAD`` to get the tree SHA of ``pyproject.toml`` and the
+    ``optimum/neuron/models/inference/`` directory, then combines them into a
+    truncated SHA-256.  This means any file change inside those paths — even on a
+    feature branch — produces a different hash and forces a re-export of test models.
+    """
     import subprocess
 
     res = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
@@ -107,18 +231,26 @@ def get_neuron_models_hash():
 
 
 def _get_hub_neuron_model_prefix():
+    """Build the HF Hub repo name prefix that encodes all invalidation keys.
+
+    Format: ``<org>/optimum-neuron-testing-<version>-<sdk>-<instance>-<code_hash>``
+    """
     return f"{TEST_HUB_ORG}/optimum-neuron-testing-{version}-{sdk_version}-{current_instance_type()}-{get_neuron_models_hash()}"
 
 
 def _get_hub_neuron_model_id(config_name: str, model_config: dict[str, str]):
+    """Return the full HF Hub repo id for a specific model configuration."""
     return f"{_get_hub_neuron_model_prefix()}-{config_name}"
 
 
 def _export_model(model_id, task, export_kwargs, neuron_model_path):
+    """Compile a model to Neuron NEFFs and save to ``neuron_model_path``."""
     if task == "text-generation":
         auto_class = NeuronModelForCausalLM
     elif task == "feature-extraction":
         auto_class = NeuronModelForEmbedding
+    elif task == "image-text-to-text":
+        auto_class = NeuronModelForImageTextToText
     else:
         raise ValueError(f"Unsupported task: {task}")
     try:
@@ -159,9 +291,14 @@ def _get_neuron_model_for_config(config_name: str, model_config, neuron_model_pa
         hub.snapshot_download(neuron_model_id, local_dir=neuron_model_path)
     else:
         model = _export_model(model_id, task, export_kwargs, neuron_model_path)
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
-        tokenizer.save_pretrained(neuron_model_path)
-        del tokenizer
+        if task == "image-text-to-text":
+            processor = AutoProcessor.from_pretrained(model_id)
+            processor.save_pretrained(neuron_model_path)
+            del processor
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(model_id)
+            tokenizer.save_pretrained(neuron_model_path)
+            del tokenizer
         # Create the test model on the hub
         model.push_to_hub(save_directory=neuron_model_path, repository_id=neuron_model_id, private=True)
         # Make sure it is cached
@@ -197,6 +334,8 @@ def any_generate_model(request):
         yield model_config
         if cache_repo_id is not None:
             os.environ["CUSTOM_CACHE_REPO"] = cache_repo_id
+        else:
+            os.environ.pop("CUSTOM_CACHE_REPO", None)
 
 
 @pytest.fixture(scope="session")
@@ -218,10 +357,18 @@ def neuron_llm_config(request):
         yield neuron_model_config
         if cache_repo_id is not None:
             os.environ["CUSTOM_CACHE_REPO"] = cache_repo_id
+        else:
+            os.environ.pop("CUSTOM_CACHE_REPO", None)
 
 
 @pytest.fixture(scope="session")
 def speculation():
+    """Provide compiled target + draft models for speculative decoding tests.
+
+    Yields a ``(neuron_model_path, draft_neuron_model_path)`` tuple.  The target
+    model is compiled with ``speculation_length=5``; the draft model is a standard
+    single-token model.  Both use ``batch_size=1, sequence_length=4096``.
+    """
     model_id = "unsloth/Llama-3.2-1B-Instruct"
     neuron_model_id = f"{_get_hub_neuron_model_prefix()}-speculation"
     draft_neuron_model_id = f"{_get_hub_neuron_model_prefix()}-speculation-draft"
@@ -351,6 +498,45 @@ def _run_exports(configs):
             progress.update(task_id, description="[green]All models exported")
 
 
+@pytest.fixture(scope="session", params=VLM_MODEL_CONFIGURATIONS.keys())
+def any_vlm_generate_model(request):
+    """Expose neuron VLM generation models for predefined configurations.
+
+    Follows the same pattern as any_generate_model but for vision-language models.
+    """
+    config_name = request.param
+    model_config = copy.deepcopy(VLM_MODEL_CONFIGURATIONS[config_name])
+    with TemporaryDirectory() as neuron_model_path:
+        model_config = _get_neuron_model_for_config(config_name, model_config, neuron_model_path)
+        cache_repo_id = os.environ.get("CUSTOM_CACHE_REPO", None)
+        os.environ["CUSTOM_CACHE_REPO"] = OPTIMUM_CACHE_REPO_ID
+        yield model_config
+        if cache_repo_id is not None:
+            os.environ["CUSTOM_CACHE_REPO"] = cache_repo_id
+        else:
+            os.environ.pop("CUSTOM_CACHE_REPO", None)
+
+
+@pytest.fixture(scope="session")
+def neuron_vlm_config(request):
+    """Expose a base neuron VLM model path for testing purposes.
+
+    Mirrors neuron_llm_config but for vision-language models.
+    """
+    first_config_name = list(VLM_MODEL_CONFIGURATIONS.keys())[0]
+    config_name = getattr(request, "param", first_config_name)
+    model_config = copy.deepcopy(VLM_MODEL_CONFIGURATIONS[config_name])
+    with TemporaryDirectory() as neuron_model_path:
+        neuron_model_config = _get_neuron_model_for_config(config_name, model_config, neuron_model_path)
+        cache_repo_id = os.environ.get("CUSTOM_CACHE_REPO", None)
+        os.environ["CUSTOM_CACHE_REPO"] = OPTIMUM_CACHE_REPO_ID
+        yield neuron_model_config
+        if cache_repo_id is not None:
+            os.environ["CUSTOM_CACHE_REPO"] = cache_repo_id
+        else:
+            os.environ.pop("CUSTOM_CACHE_REPO", None)
+
+
 if __name__ == "__main__":
     import argparse
     import fnmatch
@@ -365,11 +551,14 @@ if __name__ == "__main__":
         "pattern",
         nargs="?",
         default="*",
-        help="Glob pattern to filter configurations (e.g. 'gemma*', '*-1x8192')",
+        help="Glob pattern to filter configurations (e.g. 'gemma*', 'smolvlm*', '*-1x8192')",
     )
     args = parser.parse_args()
 
-    all_configs = list(LLM_MODEL_CONFIGURATIONS.items())
+    all_configs = [
+        *list(LLM_MODEL_CONFIGURATIONS.items()),
+        *list(VLM_MODEL_CONFIGURATIONS.items()),
+    ]
     configs = [(name, cfg) for name, cfg in all_configs if fnmatch.fnmatch(name, args.pattern)]
 
     if args.list:

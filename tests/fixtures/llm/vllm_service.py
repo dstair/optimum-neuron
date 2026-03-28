@@ -103,9 +103,23 @@ class SubprocessLauncherHandle(LauncherHandle):
 
 @pytest.fixture(scope="module")
 def event_loop():
-    loop = asyncio.get_event_loop()
-    yield loop
-    loop.close()
+    try:
+        # Check for leftover from a previous fixture instantiation
+        current_loop = asyncio.get_event_loop_policy().get_event_loop()
+        if current_loop.is_closed():
+            # Clear the unused loop before creating a new one
+            asyncio.set_event_loop(None)
+    except RuntimeError:
+        pass
+
+    # Each instance uses its own loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        yield loop
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
 
 
 @pytest.fixture(scope="module")
@@ -140,6 +154,7 @@ def vllm_launcher(event_loop):
         batch_size: int | None = None,
         sequence_length: int | None = None,
         tensor_parallel_size: int | None = None,
+        data_parallel_size: int | None = None,
         extra_args: List[str] | None = None,
     ):
         port = random.randint(8000, 10_000)
@@ -164,6 +179,8 @@ def vllm_launcher(event_loop):
             command += ["--sequence_length", str(sequence_length)]
         if tensor_parallel_size is not None:
             command += ["--tensor_parallel_size", str(tensor_parallel_size)]
+        if data_parallel_size is not None:
+            command += ["--data-parallel-size", str(data_parallel_size)]
         if extra_args is not None:
             command += extra_args
 

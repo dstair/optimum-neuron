@@ -203,6 +203,8 @@ class NeuronLlama4TextDecoderLayer(nn.Module):
 
 class NeuronLlama4TextModel(NxDDecoderModelForCausalLM):
     def __init__(self, config: Llama4TextConfig, neuron_config: NxDNeuronConfig):
+        # Accept either a full Llama4Config (VLM wrapper) or a Llama4TextConfig directly.
+        config = getattr(config, "text_config", config)
         super().__init__(config, neuron_config)
 
         self.embed_tokens = ParallelEmbedding(
@@ -245,6 +247,9 @@ class Llama4NxDModelForCausalLM(NxDModelForCausalLM):
     def convert_hf_to_neuron_state_dict(
         state_dict: dict, config: Llama4TextConfig, neuron_config: NxDNeuronConfig
     ) -> dict:
+        # Accept either a full Llama4Config (VLM wrapper) or a Llama4TextConfig directly.
+        config = getattr(config, "text_config", config)
+
         if "language_model.lm_head.weight" in state_dict:
             state_dict["lm_head.weight"] = state_dict["language_model.lm_head.weight"]
             del state_dict["language_model.lm_head.weight"]
@@ -325,6 +330,7 @@ class Llama4NxDModelForCausalLM(NxDModelForCausalLM):
         sequence_length: int,
         tensor_parallel_size: int,
         dtype: torch.dtype,
+        prefill_chunk_size: int = 0,
     ):
         continuous_batching = (batch_size > 1) if batch_size else False
         return NxDNeuronConfig(
@@ -337,4 +343,5 @@ class Llama4NxDModelForCausalLM(NxDModelForCausalLM):
             target=instance_type,
             on_device_sampling=True,
             continuous_batching=continuous_batching,
+            prefill_chunk_size=prefill_chunk_size,
         )
