@@ -19,7 +19,7 @@ Separated from test_moonlight_on_device.py to ensure exclusive device access
 
 Usage:
     MOONLIGHT_MODEL_PATH=/path/to/Moonlight-16B-A3B \
-        pytest tests/decoder/test_moonlight_export.py -v -s
+        pytest optimum/neuron/models/inference/moonlight/tests/test_moonlight_export.py -v -s
 """
 
 import os

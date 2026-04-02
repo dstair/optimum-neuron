@@ -20,12 +20,12 @@ Skipped in CI (no tiny-random checkpoint available for this architecture).
 Usage:
     # Export from scratch (~5 min compilation):
     MOONLIGHT_MODEL_PATH=/path/to/Moonlight-16B-A3B \
-        pytest tests/decoder/test_moonlight_on_device.py -v -s
+        pytest optimum/neuron/models/inference/moonlight/tests/test_moonlight_on_device.py -v -s
 
     # Reuse pre-compiled model (fast):
     MOONLIGHT_MODEL_PATH=/path/to/Moonlight-16B-A3B \
     MOONLIGHT_COMPILED_PATH=/tmp/moonlight_accuracy_compiled \
-        pytest tests/decoder/test_moonlight_on_device.py -v -s
+        pytest optimum/neuron/models/inference/moonlight/tests/test_moonlight_on_device.py -v -s
 """
 
 import os

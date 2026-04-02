@@ -11,10 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import logging
 
 from vllm.platforms.interface import UnspecifiedPlatform
-from vllm.utils import FlexibleArgumentParser
+
+try:
+    from vllm.utils import FlexibleArgumentParser
+except ImportError:
+    from argparse import ArgumentParser as FlexibleArgumentParser
 
 
 logger = logging.getLogger("Neuron")
@@ -73,10 +79,13 @@ class OptimumNeuronPlatform(UnspecifiedPlatform):
 
         if vllm_config.model_config:
             if vllm_config.model_config.use_mla:
-                raise ValueError(
-                    "MLA (Multi-Layer Attention) is not supported on Optimum Neuron platform. "
-                    "Please set `use_mla` to False in the model configuration."
+                import vllm.envs as vllm_envs
+
+                logger.info(
+                    "MLA (Multi-Layer Attention) detected but not supported on Optimum Neuron platform. "
+                    "Auto-disabling MLA — optimum-neuron manages its own KV cache for MLA models."
                 )
+                vllm_envs.VLLM_MLA_DISABLE = True
 
             # Patch ModelConfig to avoid hard-coded check in vLLM
             def verify_with_parallel_config(parallel_config) -> None:

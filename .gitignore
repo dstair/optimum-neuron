@@ -137,3 +137,6 @@ neuronxcc*/
 
 # Ignore claude settings
 .claude/
+
+# Ignore Neuron settings
+global_metric_store.json

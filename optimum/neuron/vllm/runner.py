@@ -21,7 +21,16 @@ from typing import Any
 import torch
 from vllm.config import DeviceConfig, VllmConfig
 from vllm.sampling_params import SamplingParams
-from vllm.utils import is_pin_memory_available, make_tensor_with_pad
+try:
+    from vllm.utils import is_pin_memory_available, make_tensor_with_pad
+except ImportError:
+    from vllm.platforms import current_platform
+
+    is_pin_memory_available = current_platform.is_pin_memory_available
+    try:
+        from vllm.utils.torch_utils import make_tensor_with_pad
+    except ImportError:
+        from vllm.utils import make_tensor_with_pad
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.sample.logits_processor import LogitsProcessors
@@ -214,7 +223,9 @@ class OptimumNeuronModelRunner(ABC):
 
     @staticmethod
     def create(vllm_config: VllmConfig) -> "OptimumNeuronModelRunner":
-        task = vllm_config.model_config.task or "generate"
+        task = getattr(vllm_config.model_config, "task", None) or getattr(vllm_config.model_config, "runner", None) or "generate"
+        if task == "auto":
+            task = "generate"
         if task == "generate":
             return OptimumNeuronModelRunnerForCausalLM(vllm_config)
         elif task == "embed":

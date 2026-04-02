@@ -15,7 +15,7 @@
 """Smoke tests for Moonlight (DeepSeek V3 architecture) Optimum Neuron port (CPU-only).
 
 Set MOONLIGHT_MODEL_PATH to the HuggingFace checkpoint directory, e.g.:
-    MOONLIGHT_MODEL_PATH=/path/to/Moonlight-16B-A3B-Instruct pytest tests/decoder/test_moonlight_smoke.py
+    MOONLIGHT_MODEL_PATH=/path/to/Moonlight-16B-A3B-Instruct pytest optimum/neuron/models/inference/moonlight/tests/test_moonlight_smoke.py
 """
 
 import os
