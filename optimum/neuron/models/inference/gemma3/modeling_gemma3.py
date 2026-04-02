@@ -321,8 +321,8 @@ class NxDGemma3Model(NxDDecoderModelForCausalLM):
         two attention masks (full causal and sliding window) and select the
         appropriate one for each decoder layer based on its attention_type.
         """
-        is_for_context_encoding = self._is_context_encoding(input_ids)
-        if self._is_for_speculation(input_ids):
+        is_for_context_encoding = self._is_context_encoding(input_ids.shape[-1])
+        if self._is_for_speculation(input_ids.shape[-1]):
             raise ValueError("Speculation is not supported for Gemma3 model")
 
         cache_size = self.n_positions
@@ -457,6 +457,8 @@ class Gemma3NxDModelForCausalLM(NxDModelForCausalLM):
     """
 
     _model_cls = NxDGemma3Model
+    # Gemma3's custom mixed sliding window / full attention masks don't support chunked prefill yet
+    _supports_chunked_prefill = False
 
     @staticmethod
     def convert_hf_to_neuron_state_dict(
@@ -527,6 +529,7 @@ class Gemma3NxDModelForCausalLM(NxDModelForCausalLM):
         sequence_length: int,
         tensor_parallel_size: int,
         dtype: torch.dtype,
+        prefill_chunk_size: int = 0,
     ):
         """
         Get the neuron configuration for Gemma3 model.
@@ -547,4 +550,5 @@ class Gemma3NxDModelForCausalLM(NxDModelForCausalLM):
             on_device_sampling=True,
             fused_qkv=True,
             continuous_batching=continuous_batching,
+            prefill_chunk_size=prefill_chunk_size,
         )

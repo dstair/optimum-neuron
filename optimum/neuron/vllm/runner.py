@@ -14,6 +14,7 @@
 """An optimum-neuron vLLM runner class."""
 
 import logging
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
@@ -36,7 +37,12 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 
-from .model_loader import OptimumNeuronModel, OptimumNeuronModelForCausalLM, OptimumNeuronModelForEmbedding
+from .model_loader import (
+    OptimumNeuronModel,
+    OptimumNeuronModelForCausalLM,
+    OptimumNeuronModelForEmbedding,
+    OptimumNeuronModelForImageTextToText,
+)
 from .sampler import NeuronSampler
 
 
@@ -227,6 +233,8 @@ class OptimumNeuronModelRunner(ABC):
         if task == "auto":
             task = "generate"
         if task == "generate":
+            if vllm_config.model_config.is_multimodal_model:
+                return OptimumNeuronModelRunnerForImageTextToText(vllm_config)
             return OptimumNeuronModelRunnerForCausalLM(vllm_config)
         elif task == "embed":
             return OptimumNeuronModelRunnerForEmbedding(vllm_config)
@@ -239,6 +247,8 @@ class OptimumNeuronModelRunner(ABC):
 
 
 class OptimumNeuronModelRunnerForCausalLM(OptimumNeuronModelRunner):
+    _model_cls = OptimumNeuronModelForCausalLM
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -249,13 +259,16 @@ class OptimumNeuronModelRunnerForCausalLM(OptimumNeuronModelRunner):
         self.logitsproc = LogitsProcessors()
 
     def load_model(self) -> None:
-        self.model = OptimumNeuronModelForCausalLM.create(
+        self.model = self._model_cls.create(
             self.model_config,
             parallel_config=self.parallel_config,
             scheduler_config=self.scheduler_config,
             load_config=self.load_config,
         )
-        if not self.model.model.neuron_config.on_device_sampling:
+        if (
+            not self.model.model.neuron_config.on_device_sampling
+            or self.model.model.neuron_config.prefill_chunk_size > 0
+        ):
             self.sampler = NeuronSampler(self.model.model.neuron_config)
 
     def get_supported_tasks(self) -> tuple[str, ...]:
@@ -300,35 +313,6 @@ class OptimumNeuronModelRunnerForCausalLM(OptimumNeuronModelRunner):
         # Note: We cannot process prompt and decode requests together,
         # because they use different graphs.
 
-        def get_next_tokens(
-            requests: list[OptimumNeuronCachedRequest],
-            input_ids: torch.Tensor,
-            position_ids: torch.Tensor,
-            seq_ids: torch.Tensor,
-            sampling_params: list[SamplingParams],
-        ) -> tuple[torch.Tensor, torch.Tensor | None]:
-            assert self.model is not None
-
-            sampling_params_tensor = self.tensor_for_sampling_params(sampling_params)
-
-            if self.model.model.neuron_config.on_device_sampling:
-                return self.model(
-                    input_ids=input_ids,
-                    position_ids=position_ids,
-                    seq_ids=seq_ids,
-                    sampling_params=sampling_params_tensor,
-                ), None
-            else:
-                logits = self.model(
-                    input_ids=input_ids,
-                    position_ids=position_ids,
-                    seq_ids=seq_ids,
-                    sampling_params=sampling_params_tensor,
-                )
-                sampling_metadata = create_sampling_metadata(requests, vocab_size=self.model.model.config.vocab_size)
-                sampler_outputs = self.sampler(logits, sampling_metadata)
-                return sampler_outputs.sampled_token_ids, logits
-
         # We start by decoding the next tokens for the requests already in the batch.
         req_ids = []
         tokens = None
@@ -338,16 +322,13 @@ class OptimumNeuronModelRunnerForCausalLM(OptimumNeuronModelRunner):
             (requests, input_ids, position_ids, seq_ids, sampling_params) = self._prepare_decode(
                 scheduler_output.scheduled_cached_reqs
             )
-            tokens, logprobs = get_next_tokens(requests, input_ids, position_ids, seq_ids, sampling_params)
+            tokens, logprobs = self._get_next_tokens(requests, input_ids, position_ids, seq_ids, sampling_params)
             logger.debug(f"Generated {n_decode_reqs} new tokens from cached requests: {tokens}")
 
         # Then process new prompt requests.
         if n_prompt_reqs > 0:
-            (requests, input_ids, position_ids, seq_ids, sampling_params) = self._prepare_prompt(scheduler_output)
+            requests, prompt_tokens, prompt_logprobs = self._execute_prefill(scheduler_output)
             req_ids += [request.req_id for request in requests]
-            prompt_tokens, prompt_logprobs = get_next_tokens(
-                requests, input_ids, position_ids, seq_ids, sampling_params
-            )
             logger.info(
                 f"Number of cached requests in the batch: {self.batch.num_cached_requests}/{self.batch.capacity}"
             )
@@ -375,10 +356,57 @@ class OptimumNeuronModelRunnerForCausalLM(OptimumNeuronModelRunner):
             pooler_output=[None] * len(req_ids),
         )
 
-    def _prepare_prompt(
+    def _get_next_tokens(
+        self,
+        requests: list[OptimumNeuronCachedRequest],
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        seq_ids: torch.Tensor,
+        sampling_params: list[SamplingParams],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        assert self.model is not None
+
+        sampling_params_tensor = self.tensor_for_sampling_params(sampling_params)
+
+        if self.model.model.neuron_config.on_device_sampling:
+            # unsqueeze to [batch, 1] to match CPU sampler output shape
+            return self.model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                seq_ids=seq_ids,
+                sampling_params=sampling_params_tensor,
+            ).unsqueeze(-1), None
+        else:
+            logits = self.model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                seq_ids=seq_ids,
+                sampling_params=sampling_params_tensor,
+            )
+            sampling_metadata = create_sampling_metadata(requests, vocab_size=self.model.model.config.vocab_size)
+            sampler_outputs = self.sampler(logits, sampling_metadata)
+            return sampler_outputs.sampled_token_ids, logits
+
+    def _execute_prefill(
         self,
         scheduler_output: SchedulerOutput,
-    ) -> tuple[list[OptimumNeuronCachedRequest], torch.Tensor, torch.Tensor, torch.Tensor, list[SamplingParams]]:
+    ) -> tuple[list[OptimumNeuronCachedRequest], torch.Tensor, torch.Tensor | None]:
+        chunk_size = self.model.model.neuron_config.prefill_chunk_size
+        if chunk_size > 0:
+            return self._execute_chunked_prefill(scheduler_output)
+        (requests, input_ids, position_ids, seq_ids, sampling_params) = self._prepare_prompt(scheduler_output)
+        tokens, logprobs = self._get_next_tokens(requests, input_ids, position_ids, seq_ids, sampling_params)
+        return requests, tokens, logprobs
+
+    def _collect_new_requests(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> tuple[list[OptimumNeuronCachedRequest], list[list[int]], list[list[int]], list[int], list[SamplingParams]]:
+        """Collect and register new requests from the scheduler output.
+
+        Returns (requests, input_tokens, input_positions, input_seq_ids, sampling_params)
+        as raw lists, before any tensor conversion or padding.
+        """
         assert len(scheduler_output.scheduled_new_reqs) > 0
         requests: list[OptimumNeuronCachedRequest] = []
         input_tokens: list[list[int]] = []
@@ -386,7 +414,6 @@ class OptimumNeuronModelRunnerForCausalLM(OptimumNeuronModelRunner):
         input_seq_ids: list[int] = []
         sampling_params: list[SamplingParams] = []
 
-        seq_lens: list[int] = []
         for new_request_data in scheduler_output.scheduled_new_reqs:
             request = self.batch.add_request(new_request_data)
             if request is None:
@@ -395,12 +422,21 @@ class OptimumNeuronModelRunnerForCausalLM(OptimumNeuronModelRunner):
             input_seq_ids.append(request.seq_id)
             assert new_request_data.prompt_token_ids is not None
             seq_len = len(new_request_data.prompt_token_ids)
-            seq_lens.append(seq_len)
-            input_tokens.append(new_request_data.prompt_token_ids)
+            input_tokens.append(list(new_request_data.prompt_token_ids))
             input_positions.append(list(range(seq_len)))
             assert new_request_data.sampling_params is not None
             sampling_params.append(new_request_data.sampling_params)
 
+        return requests, input_tokens, input_positions, input_seq_ids, sampling_params
+
+    def _prepare_prompt(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> tuple[list[OptimumNeuronCachedRequest], torch.Tensor, torch.Tensor, torch.Tensor, list[SamplingParams]]:
+        requests, input_tokens, input_positions, input_seq_ids, sampling_params = self._collect_new_requests(
+            scheduler_output
+        )
+        seq_lens = [len(toks) for toks in input_tokens]
         max_seq_len = max(seq_lens)
         assert max_seq_len > 0
         input_ids = make_tensor_with_pad(
@@ -412,6 +448,55 @@ class OptimumNeuronModelRunnerForCausalLM(OptimumNeuronModelRunner):
         seq_ids = torch.tensor(input_seq_ids, dtype=torch.long, device=self.device)
 
         return (requests, input_ids, position_ids, seq_ids, sampling_params)
+
+    def _execute_chunked_prefill(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> tuple[list[OptimumNeuronCachedRequest], torch.Tensor, torch.Tensor | None]:
+        """Process new prompts chunk-by-chunk, one sequence at a time.
+
+        Processing one sequence at a time is not only simpler but also faster
+        and consumes less device memory than batching multiple sequences
+        (benchmarked on trn1.32xlarge with Llama 3.1 8B).
+
+        Returns (requests, sampled_token_ids, logits).
+        """
+        chunk_size = self.model.model.neuron_config.prefill_chunk_size
+        requests, input_tokens, input_positions, input_seq_ids, sampling_params_list = self._collect_new_requests(
+            scheduler_output
+        )
+
+        seq_ids = torch.tensor(input_seq_ids, dtype=torch.long, device=self.device)
+        sampling_params_tensor = self.tensor_for_sampling_params(sampling_params_list)
+        n_seqs = len(requests)
+
+        # Process each sequence independently, one at a time.
+        per_seq_last_logits: list[torch.Tensor | None] = [None] * n_seqs
+
+        for i, (tokens, positions) in enumerate(zip(input_tokens, input_positions)):
+            seq_len = len(tokens)
+            n_chunks = math.ceil(seq_len / chunk_size)
+            for k in range(n_chunks):
+                chunk_start = k * chunk_size
+                chunk_end = min(chunk_start + chunk_size, seq_len)
+                chunk_toks = tokens[chunk_start:chunk_end]
+                chunk_pos = positions[chunk_start:chunk_end]
+                # Pad to chunk_size using repeat-last-token (same as wrapper).
+                pad_len = chunk_size - len(chunk_toks)
+                if pad_len > 0:
+                    chunk_toks = chunk_toks + [chunk_toks[-1]] * pad_len
+                    chunk_pos = chunk_pos + [chunk_pos[-1]] * pad_len
+                chunk_ids_t = torch.tensor([chunk_toks], dtype=torch.long, device=self.device)
+                chunk_pos_t = torch.tensor([chunk_pos], dtype=torch.long, device=self.device)
+                logits = self.model.prefill_chunk_vllm(
+                    chunk_ids_t, chunk_pos_t, seq_ids[i : i + 1], sampling_params_tensor[i : i + 1]
+                )
+            per_seq_last_logits[i] = logits[0].clone()
+
+        last_logits = torch.stack(per_seq_last_logits)
+        sampling_metadata = create_sampling_metadata(requests, vocab_size=self.model.model.config.vocab_size)
+        sampler_outputs = self.sampler(last_logits, sampling_metadata)
+        return requests, sampler_outputs.sampled_token_ids, last_logits
 
     def _prepare_decode(
         self,
@@ -526,3 +611,104 @@ class OptimumNeuronModelRunnerForEmbedding(OptimumNeuronModelRunner):
         )
 
         return (input_ids, attention_mask)
+
+
+class OptimumNeuronModelRunnerForImageTextToText(OptimumNeuronModelRunnerForCausalLM):
+    """Runner for vision-language models (VLMs) served through vLLM.
+
+    Extends the CausalLM runner with multimodal input handling: pixel_values
+    are extracted from the scheduler's `mm_features` and passed to the
+    Neuron model during prefill. Decode is identical to CausalLM.
+    """
+
+    _model_cls = OptimumNeuronModelForImageTextToText
+
+    @staticmethod
+    def _extract_pixel_values(new_request_data: NewRequestData) -> torch.Tensor | None:
+        """Extract and merge pixel_values from multimodal features."""
+        if not new_request_data.mm_features:
+            return None
+        pixel_values_list = []
+        for mm_feature in new_request_data.mm_features:
+            if mm_feature.modality == "image" and mm_feature.data is not None:
+                data = mm_feature.data.get_data()
+                if "pixel_values" in data:
+                    pv = data["pixel_values"]
+                    if isinstance(pv, torch.Tensor):
+                        if pv.dim() == 3:
+                            pv = pv.unsqueeze(0)
+                        pixel_values_list.append(pv)
+        if not pixel_values_list:
+            return None
+        # Stack tiles: each image may contribute multiple tiles [N_tiles, C, H, W]
+        pixel_values = torch.cat(pixel_values_list, dim=0)
+        # Add batch dimension → [1, N_total_tiles, C, H, W]
+        return pixel_values.unsqueeze(0)
+
+    def _execute_prefill(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> tuple[list[OptimumNeuronCachedRequest], torch.Tensor, torch.Tensor | None]:
+        """Process VLM prompt requests one at a time, passing pixel_values."""
+        chunk_size = self.model.model.neuron_config.prefill_chunk_size
+        requests, input_tokens, input_positions, input_seq_ids, sampling_params_list = self._collect_new_requests(
+            scheduler_output
+        )
+        seq_ids = torch.tensor(input_seq_ids, dtype=torch.long, device=self.device)
+        sampling_params_tensor = self.tensor_for_sampling_params(sampling_params_list)
+        n_seqs = len(requests)
+        per_seq_last_logits: list[torch.Tensor | None] = [None] * n_seqs
+
+        for i, (toks, positions) in enumerate(zip(input_tokens, input_positions)):
+            pixel_values = self._extract_pixel_values(scheduler_output.scheduled_new_reqs[i])
+            seq_len = len(toks)
+
+            if chunk_size > 0:
+                # Pre-compute image embeddings for the full sequence.
+                # Pad input_ids to a multiple of chunk_size so that
+                # _prepare_image_injection_tensors produces tensors whose
+                # second dimension matches what the compiled chunk graph expects.
+                n_chunks = math.ceil(seq_len / chunk_size)
+                padded_len = n_chunks * chunk_size
+                padded_toks = toks + [toks[-1]] * (padded_len - seq_len)
+                full_ids = torch.tensor([padded_toks], dtype=torch.long, device=self.device)
+                self.model.prepare_vlm_prefill(full_ids, pixel_values)
+                for k in range(n_chunks):
+                    chunk_start = k * chunk_size
+                    chunk_end = min(chunk_start + chunk_size, seq_len)
+                    chunk_toks = toks[chunk_start:chunk_end]
+                    chunk_pos = positions[chunk_start:chunk_end]
+                    pad_len = chunk_size - len(chunk_toks)
+                    if pad_len > 0:
+                        chunk_toks = chunk_toks + [chunk_toks[-1]] * pad_len
+                        chunk_pos = chunk_pos + [chunk_pos[-1]] * pad_len
+                    chunk_ids_t = torch.tensor([chunk_toks], dtype=torch.long, device=self.device)
+                    chunk_pos_t = torch.tensor([chunk_pos], dtype=torch.long, device=self.device)
+                    # Only the last chunk's logits are needed for sampling the first token.
+                    logits = self.model.prefill_chunk_vllm(
+                        chunk_ids_t, chunk_pos_t, seq_ids[i : i + 1], sampling_params_tensor[i : i + 1]
+                    )
+                self.model.reset_vlm_prefill()
+            else:
+                # Non-chunked: forward with pixel_values.
+                input_ids = make_tensor_with_pad([toks], pad=0, max_len=seq_len, dtype=torch.long, device=self.device)
+                position_ids = make_tensor_with_pad(
+                    [positions], pad=0, max_len=seq_len, dtype=torch.long, device=self.device
+                )
+                logits = self.model(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    seq_ids=seq_ids[i : i + 1],
+                    sampling_params=sampling_params_tensor[i : i + 1],
+                    pixel_values=pixel_values,
+                )
+            per_seq_last_logits[i] = logits[0].clone()
+
+        last_logits = torch.stack(per_seq_last_logits)
+        if chunk_size == 0 and self.model.model.neuron_config.on_device_sampling:
+            # Non-chunked path with on-device sampling: model returns token IDs directly.
+            # unsqueeze to [batch, 1] to match CPU sampler output shape
+            return requests, last_logits.unsqueeze(-1), None
+        sampling_metadata = create_sampling_metadata(requests, vocab_size=self.model.model.config.vocab_size)
+        sampler_outputs = self.sampler(last_logits, sampling_metadata)
+        return requests, sampler_outputs.sampled_token_ids, last_logits

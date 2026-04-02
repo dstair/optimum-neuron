@@ -22,7 +22,12 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
 from ..cache.hub_cache import select_hub_cached_entries
 from ..configuration_utils import NeuronConfig
-from ..models.inference.modeling_utils import NeuronModelForCausalLM, NeuronModelForEmbedding, NeuronPreTrainedModel
+from ..models.inference.modeling_utils import (
+    NeuronModelForCausalLM,
+    NeuronModelForEmbedding,
+    NeuronModelForImageTextToText,
+    NeuronPreTrainedModel,
+)
 from ..utils.system import get_available_cores
 from ..utils.version_utils import get_neuronxcc_version
 
@@ -35,6 +40,7 @@ neuronxcc_version = get_neuronxcc_version()
 VLLM_2_TRANSFORMERS_TASK_MAPPING = {
     "generate": "text-generation",
     "embed": "feature-extraction",
+    "image-text-to-text": "image-text-to-text",
 }
 
 
@@ -61,11 +67,6 @@ class OptimumNeuronModel(nn.Module):
                 "optimum-neuron does not support pipeline parallelism. "
                 "Please set pipeline_parallel_size to 1 in the parallel config."
             )
-        if parallel_config.data_parallel_size > 1:
-            raise ValueError(
-                "optimum-neuron does not support data parallelism. "
-                "Please set data_parallel_size to 1 in the parallel config."
-            )
         tp_degree = parallel_config.tensor_parallel_size
         available_cores = get_available_cores()
         if tp_degree > available_cores:
@@ -85,6 +86,17 @@ class OptimumNeuronModel(nn.Module):
         except EnvironmentError:
             neuron_config = None
         if neuron_config is not None:
+            # Validate max_num_seqs against compiled batch_size.
+            # The Neuron worker returns empty kv_cache_spec, so vLLM's block manager
+            # cannot limit concurrent sequences. Without this check, the scheduler
+            # may send more requests than the compiled NEFF batch_size supports.
+            max_num_seqs = scheduler_config.max_num_seqs
+            if max_num_seqs > neuron_config.batch_size:
+                raise ValueError(
+                    f"max_num_seqs ({max_num_seqs}) exceeds the compiled model "
+                    f"batch_size ({neuron_config.batch_size}). "
+                    f"Please set max_num_seqs <= {neuron_config.batch_size}."
+                )
             neuron_model = cls.auto_class.from_pretrained(
                 model_name_or_path,
                 revision=revision,
@@ -100,6 +112,8 @@ class OptimumNeuronModel(nn.Module):
             if task == "auto":
                 task = "generate"
             hf_task = VLLM_2_TRANSFORMERS_TASK_MAPPING[task]
+            if hf_task == "text-generation" and model_config.is_multimodal_model:
+                hf_task = "image-text-to-text"
             cached_entries = select_hub_cached_entries(
                 model_name_or_path,
                 task=hf_task,
@@ -197,6 +211,80 @@ class OptimumNeuronModelForCausalLM(OptimumNeuronModel):
             output = torch.index_select(output, 0, restored_indices)
 
         return output
+
+    def prefill_chunk_vllm(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        seq_ids: torch.Tensor,
+        sampling_params: torch.Tensor,
+    ) -> torch.Tensor:
+        """Process one chunk of a single prompt and return logits [1, vocab].
+
+        Only valid when neuron_config.prefill_chunk_size > 0.
+        Always called with batch_size=1: processing one sequence at a time
+        is not only simpler but also faster and consumes less device memory.
+        """
+        output = self.model.prefill_chunk(input_ids, position_ids, seq_ids, sampling_params)
+        # prefill_chunk returns [1, 1, vocab]; squeeze to [1, vocab]
+        output = output[:, -1, :]
+        return output
+
+
+class OptimumNeuronModelForImageTextToText(OptimumNeuronModel):
+    auto_class = NeuronModelForImageTextToText
+
+    def __init__(self, model: NeuronModelForImageTextToText) -> None:
+        super().__init__(model)
+        self.logits_processor = LogitsProcessor(self.model.config.vocab_size, logits_as_input=True)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        seq_ids: torch.Tensor,
+        sampling_params: torch.Tensor,
+        pixel_values: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        sorted_seq_ids, sorted_indices = torch.sort(seq_ids)
+        input_ids = torch.index_select(input_ids, 0, sorted_indices)
+        position_ids = torch.index_select(position_ids, 0, sorted_indices)
+        sampling_params = torch.index_select(sampling_params, 0, sorted_indices)
+
+        output = self.model(
+            input_ids,
+            position_ids=position_ids,
+            seq_ids=sorted_seq_ids,
+            sampling_params=sampling_params,
+            pixel_values=pixel_values,
+        )
+        if not self.model.neuron_config.on_device_sampling:
+            output = output[:, -1, :]
+
+        restored_indices = torch.argsort(sorted_indices)
+        if seq_ids.shape[0] != 1:
+            output = torch.index_select(output, 0, restored_indices)
+
+        return output
+
+    def prefill_chunk_vllm(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        seq_ids: torch.Tensor,
+        sampling_params: torch.Tensor,
+    ) -> torch.Tensor:
+        output = self.model.prefill_chunk(input_ids, position_ids, seq_ids, sampling_params)
+        output = output[:, -1, :]
+        return output
+
+    def prepare_vlm_prefill(self, input_ids: torch.Tensor, pixel_values: torch.Tensor | None):
+        """Pre-compute image embeddings for chunked prefill."""
+        self.model.prepare_vlm_prefill(input_ids, pixel_values)
+
+    def reset_vlm_prefill(self):
+        """Reset cached image embeddings after prefill completes."""
+        self.model._reset_prefill_state()
 
 
 class OptimumNeuronModelForEmbedding(OptimumNeuronModel):

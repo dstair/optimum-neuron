@@ -29,7 +29,6 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from ....modeling_utils import NeuronModelForCausalLM, NeuronModelForEmbedding
 from ...config import NxDNeuronConfig
-from ...graph_builder import NxDGraphBuilder
 from ...pretrained_model import NxDPreTrainedModel
 from ...utils.random import set_random_seed
 from ..attention.gqa import get_shardable_head_counts
@@ -44,6 +43,7 @@ from ..kvcache.kv_cache_manager import (
 )
 from .decoder_builders import NxDDecoderBuilderForCausalLM, NxDDecoderBuilderForEmbedding
 from .decoder_wrappers import (
+    CHUNKED_PREFILL_MODEL_TAG,
     CONTEXT_ENCODING_MODEL_TAG,
     SPECULATION_MODEL_TAG,
     TOKEN_GENERATION_MODEL_TAG,
@@ -96,6 +96,7 @@ class NxDDecoderModelForCausalLM(nn.Module):
                 f"Adjusting num_key_value_heads from {config.num_key_value_heads} to {num_key_value_heads} for TP {neuron_config.tp_degree}."
             )
         self.kv_mgr = KVCacheManager(config, neuron_config, actual_num_key_value_heads=num_key_value_heads)
+        self.chunk_size = neuron_config.prefill_chunk_size
 
     def initialize_process_group(self, seed: int = 0):
         if not torch.dist.is_initialized():
@@ -115,11 +116,22 @@ class NxDDecoderModelForCausalLM(nn.Module):
         # set seed
         set_random_seed(seed)
 
-    def _is_context_encoding(self, input_ids: torch.Tensor):
-        return input_ids.shape[-1] > 1 and input_ids.shape[-1] != self.speculation_length
+    def _is_context_encoding(self, seq_length: int):
+        return seq_length > 1 and seq_length != self.speculation_length
 
-    def _is_for_speculation(self, input_ids: torch.Tensor):
-        return input_ids.shape[-1] == self.speculation_length
+    def _is_chunked_prefill(self, seq_length: int):
+        return self.chunk_size > 0 and seq_length == self.chunk_size
+
+    def _is_for_speculation(self, seq_length: int):
+        return seq_length == self.speculation_length
+
+    def compute_input_embeddings(self, input_ids):
+        """Compute token embeddings from input IDs.
+
+        Subclasses (e.g. VLM decoders) can call this then modify the resulting
+        hidden states before passing them to :meth:`_forward_from_embeddings`.
+        """
+        return self.embed_tokens(input_ids)
 
     def forward(
         self,
@@ -128,7 +140,7 @@ class NxDDecoderModelForCausalLM(nn.Module):
         seq_ids,
         sampling_params,
     ):
-        """Forward pass that can return either logits or hidden states.
+        """Forward pass that returns logits or sampled tokens.
 
         Args:
             input_ids (torch.LongTensor): Input token IDs.
@@ -136,14 +148,61 @@ class NxDDecoderModelForCausalLM(nn.Module):
             seq_ids (torch.LongTensor): Sequence IDs. Used in continuous batching
             sampling_params (torch.FloatTensor): Sampling parameters.
         """
-        is_for_context_encoding = self._is_context_encoding(input_ids)
-        is_for_speculation = self._is_for_speculation(input_ids)
+        hidden_states = self.compute_input_embeddings(input_ids)
+        return self._forward_from_embeddings(hidden_states, position_ids, seq_ids, sampling_params)
+
+    def _forward_from_embeddings(
+        self,
+        hidden_states,
+        position_ids,
+        seq_ids,
+        sampling_params,
+    ):
+        """Run decoder layers, norm, KV-cache update, logit projection and sampling.
+
+        This is the bulk of the forward pass, starting from pre-computed embeddings.
+        Subclasses should override :meth:`forward` to modify ``hidden_states``
+        (e.g. inject image features) before delegating here.
+        """
+        batch_size, seq_length = hidden_states.shape[:2]
+        is_for_context_encoding = self._is_context_encoding(seq_length)
+        is_chunked_prefill = self._is_chunked_prefill(seq_length)
+        is_for_speculation = self._is_for_speculation(seq_length)
 
         cache_size = self.n_positions
 
         # Prepare input tensors
-        device = input_ids.device
-        if is_for_context_encoding:
+        device = hidden_states.device
+        if is_chunked_prefill:
+            # Chunked prefill: process a chunk of the prompt using the KV cache scatter path.
+            # Mirrors the speculation mask logic: prior mask covers already-written KV positions,
+            # active mask is a causal lower-triangle within the chunk.
+            past_key_values = self.kv_mgr.get_cache(cache_size)
+            # Chunked prefill uses batch_size=1 while the KV cache is sized for
+            # max_batch_size.  Index by seq_ids so attention shapes match the
+            # single sequence being processed.  The write path (flat combined
+            # scatter in update_cache) operates on the full cache via _fetch_cache.
+            if self.batch_size < self.kv_mgr.kv_shape[0]:
+                past_key_values = [[k[seq_ids], v[seq_ids]] for k, v in past_key_values]
+            chunk_size = seq_length
+            max_cached_positions = position_ids[:, :1].expand(self.batch_size, self.n_positions) - 1
+            all_positions = (
+                torch.arange(self.n_positions, device=device).view(1, -1).expand(self.batch_size, self.n_positions)
+            )
+            attention_mask = (max_cached_positions >= all_positions).view(self.batch_size, 1, 1, self.n_positions)
+            attention_mask = attention_mask.expand(self.batch_size, 1, chunk_size, self.n_positions)
+            causal_mask = torch.full((chunk_size, chunk_size), True, device=device).tril(diagonal=0)
+            # Block attention to padded positions so padded tokens attend to the
+            # exact same set of positions as the real last token.  This makes their
+            # KV identical to the real token's, so the scatter overwrite at the
+            # repeated position is a true no-op (avoids non-deterministic scatter
+            # behaviour with duplicate indices corrupting the cache).
+            # We attend to tokens whose position_id is still increasing.
+            actual_tokens_mask = torch.ones(self.batch_size, chunk_size, dtype=torch.bool, device=device)
+            actual_tokens_mask[:, 1:] = position_ids[:, 1:] > position_ids[:, :-1]
+            active_mask = causal_mask.unsqueeze(0) & actual_tokens_mask.unsqueeze(1)
+            active_mask = active_mask[:, None, :, :]
+        elif is_for_context_encoding:
             past_key_values = None
             # Lower triangle causal mask for classic attention
             # Note that the mask is created for the full sequence length even if only a part of it is used
@@ -182,12 +241,7 @@ class NxDDecoderModelForCausalLM(nn.Module):
                 # Active mask is implicit for decoding
                 active_mask = None
 
-        batch_size, seq_length = input_ids.shape[:2]
         position_ids = position_ids.view(-1, seq_length).long()
-
-        # embed positions
-        inputs_embeds = self.embed_tokens(input_ids)
-        hidden_states = inputs_embeds
 
         # decoder layers
         new_key_values = []
@@ -214,6 +268,7 @@ class NxDDecoderModelForCausalLM(nn.Module):
 
         updated_kv_cache = self.kv_mgr.update_cache(
             is_for_context_encoding=is_for_context_encoding,
+            is_chunked_prefill=is_chunked_prefill,
             seq_ids=seq_ids,
             position_ids=position_ids,
             new_key_values=new_key_values,
@@ -273,28 +328,40 @@ class NxDModelForCausalLM(NxDGenerationMixin, NxDPreTrainedModel, NeuronModelFor
     """
 
     _model_cls = None
+    _text_bundle_key = "model"
+    _context_wrapper_cls = NxDDecoderWrapperForCausalLM
+    _chunked_prefill_wrapper_cls = NxDDecoderWrapperForCausalLM
+    _token_generation_wrapper_cls = NxDDecoderWrapperForCausalLM
+    _speculation_wrapper_cls = NxDDecoderWrapperForCausalLM
 
     def __init__(
         self,
         config: PretrainedConfig,
         neuron_config: NxDNeuronConfig,
-        traced_model: torch.jit.ScriptModule,
-        graph_builders: list[NxDGraphBuilder],
+        traced_models: dict[str, torch.jit.ScriptModule],
+        graph_builders: dict[str, dict],
     ):
         super().__init__(
-            config=config, neuron_config=neuron_config, traced_model=traced_model, graph_builders=graph_builders
+            config=config, neuron_config=neuron_config, traced_models=traced_models, graph_builders=graph_builders
         )
-        ctx_neuron_config = NxDModelForCausalLM._create_context_encoding_config(neuron_config)
-        self.context_encoding_model = NxDDecoderWrapperForCausalLM(
-            config=config, neuron_config=ctx_neuron_config, model=traced_model, tag=CONTEXT_ENCODING_MODEL_TAG
-        )
+        traced_model = traced_models[self._text_bundle_key]
+        if neuron_config.prefill_chunk_size > 0:
+            chunk_neuron_config = NxDModelForCausalLM._create_chunked_prefill_config(neuron_config)
+            self.chunked_prefill_model = self._chunked_prefill_wrapper_cls(
+                config=config, neuron_config=chunk_neuron_config, model=traced_model, tag=CHUNKED_PREFILL_MODEL_TAG
+            )
+        else:
+            ctx_neuron_config = NxDModelForCausalLM._create_context_encoding_config(neuron_config)
+            self.context_encoding_model = self._context_wrapper_cls(
+                config=config, neuron_config=ctx_neuron_config, model=traced_model, tag=CONTEXT_ENCODING_MODEL_TAG
+            )
         tkg_neuron_config = NxDModelForCausalLM._create_token_generation_config(neuron_config)
-        self.token_generation_model = NxDDecoderWrapperForCausalLM(
+        self.token_generation_model = self._token_generation_wrapper_cls(
             config=config, neuron_config=tkg_neuron_config, model=traced_model, tag=TOKEN_GENERATION_MODEL_TAG
         )
         if neuron_config.speculation_length > 0:
             spec_neuron_config = NxDModelForCausalLM._create_speculation_config(neuron_config)
-            self.speculation_model = NxDDecoderWrapperForCausalLM(
+            self.speculation_model = self._speculation_wrapper_cls(
                 config=config,
                 neuron_config=spec_neuron_config,
                 model=traced_model,
@@ -307,6 +374,23 @@ class NxDModelForCausalLM(NxDGenerationMixin, NxDPreTrainedModel, NeuronModelFor
         self.sampler = None
 
     @staticmethod
+    def _create_chunked_prefill_config(neuron_config: NxDNeuronConfig) -> NxDNeuronConfig:
+        # Compile the chunked prefill graph with batch_size=1, mirroring
+        # continuous batching's ctx_batch_size.  Processing one sequence at a
+        # time is not only simpler but also faster and consumes less device
+        # memory than batching multiple sequences.
+        # The KV scatter uses seq_ids to route writes to the correct cache slot
+        # (see kv_cache_manager.update_cache), so max_batch_size is preserved
+        # for KV cache sizing while the forward-pass batch dim is just 1.
+        cp_config = copy.deepcopy(neuron_config)
+        cp_config.batch_size = neuron_config.ctx_batch_size
+        # Always disable on-device sampling for the chunked prefill graph:
+        # the prefill graph returns logits for CPU sampling, while the token
+        # generation graph can keep on-device sampling enabled (hybrid ODS).
+        cp_config.on_device_sampling = False
+        return cp_config
+
+    @staticmethod
     def _create_context_encoding_config(neuron_config: NxDNeuronConfig) -> NxDNeuronConfig:
         ctx_neuron_config = copy.deepcopy(neuron_config)
         ctx_neuron_config.batch_size = neuron_config.ctx_batch_size
@@ -316,6 +400,7 @@ class NxDModelForCausalLM(NxDGenerationMixin, NxDPreTrainedModel, NeuronModelFor
     def _create_token_generation_config(neuron_config: NxDNeuronConfig) -> NxDNeuronConfig:
         tkg_neuron_config = copy.deepcopy(neuron_config)
         tkg_neuron_config.batch_size = neuron_config.tkg_batch_size
+        tkg_neuron_config.prefill_chunk_size = 0  # Token generation never uses chunked prefill
         return tkg_neuron_config
 
     @staticmethod
@@ -329,14 +414,24 @@ class NxDModelForCausalLM(NxDGenerationMixin, NxDPreTrainedModel, NeuronModelFor
         if cls._model_cls is None:
             raise SystemError(f"No underlying model class defined for {cls}.")
         graph_builders = {}
-        ctx_neuron_config = NxDModelForCausalLM._create_context_encoding_config(neuron_config)
-        graph_builders["context_encoding"] = NxDDecoderBuilderForCausalLM(
-            config=config,
-            neuron_config=ctx_neuron_config,
-            max_tokens=ctx_neuron_config.max_context_length,
-            active_tokens=ctx_neuron_config.max_context_length,
-            model_cls=cls._model_cls,
-        )
+        if neuron_config.prefill_chunk_size > 0:
+            chunk_neuron_config = NxDModelForCausalLM._create_chunked_prefill_config(neuron_config)
+            graph_builders["chunked_prefill"] = NxDDecoderBuilderForCausalLM(
+                config=config,
+                neuron_config=chunk_neuron_config,
+                max_tokens=chunk_neuron_config.sequence_length,
+                active_tokens=chunk_neuron_config.prefill_chunk_size,
+                model_cls=cls._model_cls,
+            )
+        else:
+            ctx_neuron_config = NxDModelForCausalLM._create_context_encoding_config(neuron_config)
+            graph_builders["context_encoding"] = NxDDecoderBuilderForCausalLM(
+                config=config,
+                neuron_config=ctx_neuron_config,
+                max_tokens=ctx_neuron_config.max_context_length,
+                active_tokens=ctx_neuron_config.max_context_length,
+                model_cls=cls._model_cls,
+            )
         tkg_neuron_config = NxDModelForCausalLM._create_token_generation_config(neuron_config)
         graph_builders["token_generation"] = NxDDecoderBuilderForCausalLM(
             config=config,
@@ -356,7 +451,7 @@ class NxDModelForCausalLM(NxDGenerationMixin, NxDPreTrainedModel, NeuronModelFor
                 model_cls=cls._model_cls,
                 priority_model_idx=0,  # to turn on weight layout optimization
             )
-        return graph_builders
+        return {"model": graph_builders}
 
     def forward(
         self,
@@ -378,6 +473,11 @@ class NxDModelForCausalLM(NxDGenerationMixin, NxDPreTrainedModel, NeuronModelFor
             validate_sampling_params(sampling_params, self.neuron_config.max_topk)
 
         if input_ids.shape[-1] > 1 and not position_ids.min().item():
+            if self.neuron_config.prefill_chunk_size > 0:
+                raise ValueError(
+                    "When prefill_chunk_size > 0, call generate() or prefill_chunk() instead of forward() "
+                    "for multi-token (prefill) inputs."
+                )
             outputs = self.context_encoding_model(
                 input_ids,
                 position_ids,
@@ -402,6 +502,12 @@ class NxDModelForCausalLM(NxDGenerationMixin, NxDPreTrainedModel, NeuronModelFor
                 sampling_params,
             )
 
+        return outputs
+
+    def prefill_chunk(self, input_ids, position_ids, seq_ids, sampling_params):
+        """Process one chunk of a prompt. Call sequentially for each chunk in order."""
+        outputs = self.chunked_prefill_model(input_ids, position_ids, seq_ids, sampling_params)
+        self.kv_cache_populated = True
         return outputs
 
     def reset(self):
@@ -517,12 +623,13 @@ class NxDModelForEmbedding(NxDPreTrainedModel, NeuronModelForEmbedding):
         self,
         config: PretrainedConfig,
         neuron_config: NxDNeuronConfig,
-        traced_model: torch.jit.ScriptModule,
-        graph_builders: list[NxDGraphBuilder],
+        traced_models: dict[str, torch.jit.ScriptModule],
+        graph_builders: dict[str, dict],
     ):
         super().__init__(
-            config=config, neuron_config=neuron_config, traced_model=traced_model, graph_builders=graph_builders
+            config=config, neuron_config=neuron_config, traced_models=traced_models, graph_builders=graph_builders
         )
+        traced_model = traced_models["model"]
         self.encoding_model = NxDDecoderWrapperForEmbedding(
             config=config,
             neuron_config=neuron_config,
@@ -536,12 +643,14 @@ class NxDModelForEmbedding(NxDPreTrainedModel, NeuronModelForEmbedding):
         if cls._model_cls is None:
             raise SystemError(f"No underlying model class defined for {cls}.")
         return {
-            "encoding": NxDDecoderBuilderForEmbedding(
-                config=config,
-                neuron_config=neuron_config,
-                max_tokens=neuron_config.max_context_length,
-                model_cls=cls._model_cls,
-            )
+            "model": {
+                "encoding": NxDDecoderBuilderForEmbedding(
+                    config=config,
+                    neuron_config=neuron_config,
+                    max_tokens=neuron_config.max_context_length,
+                    model_cls=cls._model_cls,
+                )
+            }
         }
 
     def forward(

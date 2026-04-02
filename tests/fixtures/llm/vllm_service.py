@@ -64,6 +64,36 @@ class TestClient(AsyncOpenAI):
     async def greedy(self, prompt: str, max_output_tokens: int, stop: List[str] | None = None):
         return await self.sample(prompt, max_output_tokens=max_output_tokens, temperature=0, stop=stop)
 
+    async def sample_with_images(
+        self,
+        prompt: str,
+        image_urls: List[str],
+        max_output_tokens: int,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        stop: List[str] | None = None,
+    ):
+        content = [{"type": "image_url", "image_url": {"url": url}} for url in image_urls]
+        content.append({"type": "text", "text": prompt})
+        response = await self.chat.completions.create(
+            model=self.model_name,
+            messages=[{"role": "user", "content": content}],
+            max_completion_tokens=max_output_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop,
+        )
+        generated_tokens = response.usage.completion_tokens
+        generated_text = response.choices[0].message.content
+        return generated_tokens, generated_text
+
+    async def greedy_with_images(
+        self, prompt: str, image_urls: List[str], max_output_tokens: int, stop: List[str] | None = None
+    ):
+        return await self.sample_with_images(
+            prompt, image_urls, max_output_tokens=max_output_tokens, temperature=0, stop=stop
+        )
+
 
 class LauncherHandle:
     def __init__(self, service_name: str, model_name: str, port: int):
@@ -103,9 +133,23 @@ class SubprocessLauncherHandle(LauncherHandle):
 
 @pytest.fixture(scope="module")
 def event_loop():
-    loop = asyncio.get_event_loop()
-    yield loop
-    loop.close()
+    try:
+        # Check for leftover from a previous fixture instantiation
+        current_loop = asyncio.get_event_loop_policy().get_event_loop()
+        if current_loop.is_closed():
+            # Clear the unused loop before creating a new one
+            asyncio.set_event_loop(None)
+    except RuntimeError:
+        pass
+
+    # Each instance uses its own loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        yield loop
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
 
 
 @pytest.fixture(scope="module")
@@ -140,6 +184,7 @@ def vllm_launcher(event_loop):
         batch_size: int | None = None,
         sequence_length: int | None = None,
         tensor_parallel_size: int | None = None,
+        data_parallel_size: int | None = None,
         extra_args: List[str] | None = None,
     ):
         port = random.randint(8000, 10_000)
@@ -164,6 +209,8 @@ def vllm_launcher(event_loop):
             command += ["--sequence_length", str(sequence_length)]
         if tensor_parallel_size is not None:
             command += ["--tensor_parallel_size", str(tensor_parallel_size)]
+        if data_parallel_size is not None:
+            command += ["--data-parallel-size", str(data_parallel_size)]
         if extra_args is not None:
             command += extra_args
 
